@@ -27,6 +27,12 @@ std::string Utf8FromUtf16(std::wstring_view utf16_string) {
   return utf8_string;
 }
 
+// Null-safe overload — see header for the WebView2/UB rationale.
+std::string Utf8FromUtf16(const wchar_t* utf16_string) {
+  return utf16_string ? Utf8FromUtf16(std::wstring_view(utf16_string))
+                      : std::string();
+}
+
 std::wstring Utf16FromUtf8(std::string_view utf8_string) {
   if (utf8_string.empty()) {
     return std::wstring();
@@ -49,6 +55,12 @@ std::wstring Utf16FromUtf8(std::string_view utf8_string) {
     return std::wstring();
   }
   return utf16_string;
+}
+
+// Null-safe overload — see header.
+std::wstring Utf16FromUtf8(const char* utf8_string) {
+  return utf8_string ? Utf16FromUtf8(std::string_view(utf8_string))
+                     : std::wstring();
 }
 
 }  // namespace util
