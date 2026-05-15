@@ -76,13 +76,45 @@ class WebviewWindowsPlugin : public flutter::Plugin {
 // static
 void WebviewWindowsPlugin::RegisterWithRegistrar(
     flutter::PluginRegistrarWindows* registrar) {
+  // Defensive null checks: on some Windows engine builds (and during
+  // partially-initialised plugin registration ordering) the registrar or
+  // its messenger/texture_registrar can be null or point at an
+  // incompletely-constructed Flutter wrapper. Dereferencing them here
+  // surfaces as `EXCEPTION_ACCESS_VIOLATION_READ` at offsets like 0x1e8
+  // inside `FlutterDesktopMessengerSetCallback`, which crashes the host
+  // app before it ever paints. Bail out gracefully instead — the plugin
+  // will be non-functional this session, but the app keeps running.
+  if (!registrar) {
+    OutputDebugStringW(
+        L"[webview_windows] RegisterWithRegistrar: registrar is null; "
+        L"skipping plugin registration.\n");
+    return;
+  }
+
+  auto* messenger = registrar->messenger();
+  if (!messenger) {
+    OutputDebugStringW(
+        L"[webview_windows] RegisterWithRegistrar: registrar->messenger() "
+        L"returned null; skipping plugin registration.\n");
+    return;
+  }
+
+  auto* texture_registrar = registrar->texture_registrar();
+  if (!texture_registrar) {
+    OutputDebugStringW(
+        L"[webview_windows] RegisterWithRegistrar: "
+        L"registrar->texture_registrar() returned null; skipping plugin "
+        L"registration.\n");
+    return;
+  }
+
   auto channel =
       std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
-          registrar->messenger(), "io.jns.webview.win",
+          messenger, "io.jns.webview.win",
           &flutter::StandardMethodCodec::GetInstance());
 
-  auto plugin = std::make_unique<WebviewWindowsPlugin>(
-      registrar->texture_registrar(), registrar->messenger());
+  auto plugin =
+      std::make_unique<WebviewWindowsPlugin>(texture_registrar, messenger);
 
   channel->SetMethodCallHandler(
       [plugin_pointer = plugin.get()](const auto& call, auto result) {
