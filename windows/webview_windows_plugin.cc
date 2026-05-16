@@ -54,10 +54,24 @@ class WebviewWindowsPlugin : public flutter::Plugin {
 
   virtual ~WebviewWindowsPlugin();
 
+  // Transfer ownership of the plugin-level method channel to the
+  // plugin so its destructor can null the handler before the
+  // captured `plugin_pointer` in the lambda dangles. Called once
+  // from RegisterWithRegistrar.
+  void set_method_channel(
+      std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
+          channel) {
+    channel_ = std::move(channel);
+  }
+
  private:
   std::unique_ptr<WebviewPlatform> platform_;
   std::unique_ptr<WebviewHost> webview_host_;
   std::unordered_map<int64_t, std::unique_ptr<WebviewBridge>> instances_;
+  // Plugin-level method channel. Held as a member (not a local in
+  // RegisterWithRegistrar) so the destructor can null its handler
+  // before the lambda's captured `plugin_pointer` dangles.
+  std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel_;
 
   WNDCLASS window_class_ = {};
   flutter::TextureRegistrar* textures_;
@@ -121,6 +135,14 @@ void WebviewWindowsPlugin::RegisterWithRegistrar(
         plugin_pointer->HandleMethodCall(call, std::move(result));
       });
 
+  // Hand the channel to the plugin so the destructor can null the
+  // handler before `plugin_pointer` becomes a dangling raw pointer.
+  // Without this, any queued WM_ message that fires after Flutter
+  // tears down the messenger but before this DLL unloads dereferences
+  // freed memory → EXCEPTION_ACCESS_VIOLATION_READ at offset ~0x1e8
+  // inside FlutterDesktopMessengerSetCallback.
+  plugin->set_method_channel(std::move(channel));
+
   registrar->AddPlugin(std::move(plugin));
 }
 
@@ -133,6 +155,18 @@ WebviewWindowsPlugin::WebviewWindowsPlugin(flutter::TextureRegistrar* textures,
 }
 
 WebviewWindowsPlugin::~WebviewWindowsPlugin() {
+  // Null the plugin-level handler first: the lambda registered in
+  // RegisterWithRegistrar captures a raw `plugin_pointer = this`,
+  // and the messenger keeps that lambda alive independently of the
+  // MethodChannel wrapper. Without this null-out, a callback that
+  // fires after we return calls into freed `*this` and the host app
+  // dies in an EXCEPTION_ACCESS_VIOLATION_READ at offset ~0x1e8
+  // inside FlutterDesktopMessengerSetCallback. Per-WebviewBridge
+  // channels are cleared in their own destructor (webview_bridge.cc)
+  // when instances_.clear() runs immediately after this.
+  if (channel_) {
+    channel_->SetMethodCallHandler(nullptr);
+  }
   instances_.clear();
   UnregisterClass(window_class_.lpszClassName, nullptr);
 }

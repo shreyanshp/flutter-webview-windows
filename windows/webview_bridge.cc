@@ -194,7 +194,18 @@ WebviewBridge::WebviewBridge(flutter::BinaryMessenger* messenger,
 }
 
 WebviewBridge::~WebviewBridge() {
+  // Null out every messenger-registered callback BEFORE we let any
+  // child field destruct. On WM_CLOSE Flutter destroys the engine
+  // messenger; a queued callback that arrives between "messenger
+  // freed" and "plugin pointer freed" dereferences a dangling
+  // vtable → EXCEPTION_ACCESS_VIOLATION_READ at offset ~0x1e8
+  // inside FlutterDesktopMessengerSetCallback (Sentry minidump
+  // signature on the host app). method_channel_ was already cleared;
+  // event_channel_ was not, and EmitEvent could still fire through
+  // event_sink_ from a backgrounded WebView2 callback.
   method_channel_->SetMethodCallHandler(nullptr);
+  event_channel_->SetStreamHandler(nullptr);
+  event_sink_.reset();
   texture_registrar_->UnregisterTexture(texture_id_);
 }
 
