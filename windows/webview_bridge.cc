@@ -133,13 +133,47 @@ static const std::string& GetCursorName(const HCURSOR cursor) {
   return kDefaultCursorName;
 }
 
+// SEH-protected cleanup helpers. Kept at file scope so the MSVC SEH
+// restriction "no objects with destructors declared inside __try"
+// doesn't bite — locals only live inside these tiny shims.
+//
+// We use SEH (not C++ try/catch) because the failure mode we're
+// containing is an EXCEPTION_ACCESS_VIOLATION_READ raised by
+// flutter_windows.dll deref'ing an already-invalidated messenger /
+// texture registrar during engine teardown. The Windows kernel
+// raises that as a SEH exception, not a C++ exception — C++ try
+// would not catch it.
+static void TryResetEventSinkSafe(
+    std::unique_ptr<flutter::EventSink<flutter::EncodableValue>>* sink) {
+  __try {
+    sink->reset();
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    OutputDebugStringW(
+        L"[webview_windows] ~WebviewBridge: event_sink_.reset() raised "
+        L"a structured exception during teardown; swallowed.\n");
+  }
+}
+
+static void TryUnregisterTextureSafe(flutter::TextureRegistrar* registrar,
+                                     int64_t texture_id) {
+  __try {
+    registrar->UnregisterTexture(texture_id);
+  } __except (EXCEPTION_EXECUTE_HANDLER) {
+    OutputDebugStringW(
+        L"[webview_windows] ~WebviewBridge: UnregisterTexture raised a "
+        L"structured exception during teardown; swallowed.\n");
+  }
+}
+
 }  // namespace
 
 WebviewBridge::WebviewBridge(flutter::BinaryMessenger* messenger,
                              flutter::TextureRegistrar* texture_registrar,
                              GraphicsContext* graphics_context,
                              std::unique_ptr<Webview> webview)
-    : webview_(std::move(webview)), texture_registrar_(texture_registrar) {
+    : alive_(std::make_shared<std::atomic<bool>>(true)),
+      webview_(std::move(webview)),
+      texture_registrar_(texture_registrar) {
   texture_bridge_ =
       std::make_unique<TextureBridgeGpu>(graphics_context, webview_->surface());
 
@@ -153,8 +187,17 @@ WebviewBridge::WebviewBridge(flutter::BinaryMessenger* messenger,
           }));
 
   texture_id_ = texture_registrar->RegisterTexture(flutter_texture_.get());
-  texture_bridge_->SetOnFrameAvailable(
-      [this]() { texture_registrar_->MarkTextureFrameAvailable(texture_id_); });
+  // Frame-available callback fires from the texture bridge's render
+  // thread. After ~WebviewBridge starts (alive_=false) the
+  // texture_registrar_ pointer may already point at freed memory —
+  // the alive_ check below is the only thing keeping us from
+  // dereferencing it. Capture alive_ by value (shared_ptr) so the
+  // flag outlives the bridge for as long as any in-flight callback
+  // holds it.
+  texture_bridge_->SetOnFrameAvailable([this, alive = alive_]() {
+    if (!alive->load(std::memory_order_acquire)) return;
+    texture_registrar_->MarkTextureFrameAvailable(texture_id_);
+  });
   // texture_bridge_->SetOnSurfaceSizeChanged([this](Size size) {
   //  webview_->SetSurfaceSize(size.width, size.height);
   //});
@@ -165,9 +208,18 @@ WebviewBridge::WebviewBridge(flutter::BinaryMessenger* messenger,
       std::make_unique<flutter::MethodChannel<flutter::EncodableValue>>(
           messenger, method_channel_name,
           &flutter::StandardMethodCodec::GetInstance());
-  method_channel_->SetMethodCallHandler([this](const auto& call, auto result) {
-    HandleMethodCall(call, std::move(result));
-  });
+  method_channel_->SetMethodCallHandler(
+      [this, alive = alive_](const auto& call, auto result) {
+        if (!alive->load(std::memory_order_acquire)) {
+          // Bridge destructed under us — fail the call rather than
+          // crash. Dart side just sees a one-shot error per channel
+          // call until the engine finishes tearing the messenger down.
+          result->Error("bridge_destroyed",
+                        "WebviewBridge no longer alive");
+          return;
+        }
+        HandleMethodCall(call, std::move(result));
+      });
 
   const auto event_channel_name =
       std::format("io.jns.webview.win/{}/events", texture_id_);
@@ -178,14 +230,25 @@ WebviewBridge::WebviewBridge(flutter::BinaryMessenger* messenger,
 
   auto handler = std::make_unique<
       flutter::StreamHandlerFunctions<flutter::EncodableValue>>(
-      [this](const flutter::EncodableValue* arguments,
-             std::unique_ptr<flutter::EventSink<flutter::EncodableValue>>&&
-                 events) {
+      [this, alive = alive_](
+          const flutter::EncodableValue* arguments,
+          std::unique_ptr<flutter::EventSink<flutter::EncodableValue>>&&
+              events) -> std::unique_ptr<
+                              flutter::StreamHandlerError<
+                                  flutter::EncodableValue>> {
+        if (!alive->load(std::memory_order_acquire)) {
+          return nullptr;
+        }
         event_sink_ = std::move(events);
         RegisterEventHandlers();
         return nullptr;
       },
-      [this](const flutter::EncodableValue* arguments) {
+      [this, alive = alive_](const flutter::EncodableValue* arguments)
+          -> std::unique_ptr<
+              flutter::StreamHandlerError<flutter::EncodableValue>> {
+        if (!alive->load(std::memory_order_acquire)) {
+          return nullptr;
+        }
         event_sink_ = nullptr;
         return nullptr;
       });
@@ -194,19 +257,40 @@ WebviewBridge::WebviewBridge(flutter::BinaryMessenger* messenger,
 }
 
 WebviewBridge::~WebviewBridge() {
-  // Null out every messenger-registered callback BEFORE we let any
-  // child field destruct. On WM_CLOSE Flutter destroys the engine
-  // messenger; a queued callback that arrives between "messenger
-  // freed" and "plugin pointer freed" dereferences a dangling
-  // vtable → EXCEPTION_ACCESS_VIOLATION_READ at offset ~0x1e8
-  // inside FlutterDesktopMessengerSetCallback (Sentry minidump
-  // signature on the host app). method_channel_ was already cleared;
-  // event_channel_ was not, and EmitEvent could still fire through
-  // event_sink_ from a backgrounded WebView2 callback.
-  method_channel_->SetMethodCallHandler(nullptr);
-  event_channel_->SetStreamHandler(nullptr);
-  event_sink_.reset();
-  texture_registrar_->UnregisterTexture(texture_id_);
+  // 1. Flip the alive flag FIRST. Any callback dispatched after this
+  //    point — Win32 message queue, WebView2 worker thread,
+  //    texture bridge render thread, messenger MethodCall, or
+  //    EventChannel stream handler — sees alive_=false at its
+  //    atomic_load and returns without touching freed state.
+  //
+  //    memory_order_release here pairs with memory_order_acquire in
+  //    the lambdas, so any bridge state mutated before this point
+  //    is visible to the loading thread before it reads alive_.
+  alive_->store(false, std::memory_order_release);
+
+  // 2. Reset event_sink_ inside an SEH guard. EventSink::Success
+  //    routes through the engine's BinaryMessenger; the destructor
+  //    of an EventSink that has been disconnected by engine
+  //    teardown can AV the same way SetMessageHandler(nullptr) did.
+  TryResetEventSinkSafe(&event_sink_);
+
+  // 3. Unregister the texture inside an SEH guard. The engine's
+  //    TextureRegistrar lifetime is bound to the FlutterView, and
+  //    on the destroy paths that fire ~WebviewBridge during late
+  //    shutdown the registrar may already be freed. Process exit
+  //    reclaims any leaked texture handle automatically.
+  TryUnregisterTextureSafe(texture_registrar_, texture_id_);
+
+  // Deliberately NOT calling method_channel_->SetMethodCallHandler(
+  // nullptr) or event_channel_->SetStreamHandler(nullptr) — both
+  // route through FlutterDesktopMessengerSetCallback, which AVed at
+  // offset 0x1e8 on the engine's destroy order when the messenger
+  // was already invalidated (Sentry MOBILE-NEWS-CN, 2026-05).
+  // alive_ above is the safety net for the original
+  // lambda-fires-on-freed-bridge crash that the previous fix
+  // (commit 6939335) was trying to address — that fix unfortunately
+  // also introduced these two SetXHandler calls, which is why the
+  // crash kept re-firing on builds 1572-1592.
 }
 
 void WebviewBridge::RegisterEventHandlers() {

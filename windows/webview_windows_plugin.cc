@@ -5,6 +5,7 @@
 #include <flutter/standard_method_codec.h>
 #include <windows.h>
 
+#include <atomic>
 #include <memory>
 #include <string>
 #include <unordered_map>
@@ -55,22 +56,34 @@ class WebviewWindowsPlugin : public flutter::Plugin {
   virtual ~WebviewWindowsPlugin();
 
   // Transfer ownership of the plugin-level method channel to the
-  // plugin so its destructor can null the handler before the
-  // captured `plugin_pointer` in the lambda dangles. Called once
-  // from RegisterWithRegistrar.
+  // plugin so it outlives the RegisterWithRegistrar scope. The
+  // channel is intentionally NEVER asked to null its handler in
+  // the destructor — that path AVed on the engine's destroy order
+  // (Sentry MOBILE-NEWS-CN). The alive_ flag below makes that
+  // unnecessary: any callback that fires after destruction sees
+  // alive_=false and returns without touching `*this`.
   void set_method_channel(
       std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>>
           channel) {
     channel_ = std::move(channel);
   }
 
+  // Shared "alive" flag — see WebviewBridge::alive() for full
+  // rationale. Captured by-value (shared_ptr) into the plugin-level
+  // MethodCallHandler lambda. ~WebviewWindowsPlugin sets this to
+  // false first thing, so any callback the messenger dispatches
+  // afterwards no-ops cleanly.
+  std::shared_ptr<std::atomic<bool>> alive() const { return alive_; }
+
  private:
+  std::shared_ptr<std::atomic<bool>> alive_;
   std::unique_ptr<WebviewPlatform> platform_;
   std::unique_ptr<WebviewHost> webview_host_;
   std::unordered_map<int64_t, std::unique_ptr<WebviewBridge>> instances_;
-  // Plugin-level method channel. Held as a member (not a local in
-  // RegisterWithRegistrar) so the destructor can null its handler
-  // before the lambda's captured `plugin_pointer` dangles.
+  // Plugin-level method channel. Held as a member so the lambda we
+  // pass to SetMethodCallHandler keeps a stable target across the
+  // RegisterWithRegistrar scope. We do NOT null the handler in the
+  // destructor (see set_method_channel comment above).
   std::unique_ptr<flutter::MethodChannel<flutter::EncodableValue>> channel_;
 
   WNDCLASS window_class_ = {};
@@ -130,17 +143,30 @@ void WebviewWindowsPlugin::RegisterWithRegistrar(
   auto plugin =
       std::make_unique<WebviewWindowsPlugin>(texture_registrar, messenger);
 
+  // Capture the alive flag by VALUE (shared_ptr) into the lambda.
+  // The flag outlives the plugin for as long as the messenger still
+  // holds this lambda — so a late-firing WM_ message that arrives
+  // after the plugin destructed atomic-loads alive_=false and the
+  // callback returns an error rather than dereferencing freed
+  // `*plugin_pointer`. This replaces the earlier defence (commit
+  // 6939335) which tried to null the handler in the destructor;
+  // that path itself AVed inside FlutterDesktopMessengerSetCallback
+  // when the engine had already invalidated the messenger by the
+  // time the plugin destructed (Sentry MOBILE-NEWS-CN, 2026-05).
   channel->SetMethodCallHandler(
-      [plugin_pointer = plugin.get()](const auto& call, auto result) {
+      [plugin_pointer = plugin.get(), alive = plugin->alive()](
+          const auto& call, auto result) {
+        if (!alive->load(std::memory_order_acquire)) {
+          result->Error("plugin_destroyed",
+                        "WebviewWindowsPlugin no longer alive");
+          return;
+        }
         plugin_pointer->HandleMethodCall(call, std::move(result));
       });
 
-  // Hand the channel to the plugin so the destructor can null the
-  // handler before `plugin_pointer` becomes a dangling raw pointer.
-  // Without this, any queued WM_ message that fires after Flutter
-  // tears down the messenger but before this DLL unloads dereferences
-  // freed memory → EXCEPTION_ACCESS_VIOLATION_READ at offset ~0x1e8
-  // inside FlutterDesktopMessengerSetCallback.
+  // Hand the channel to the plugin so it outlives this scope. We
+  // never null the handler in the destructor — the alive_ flag
+  // above is the safety net for callbacks queued past teardown.
   plugin->set_method_channel(std::move(channel));
 
   registrar->AddPlugin(std::move(plugin));
@@ -148,27 +174,40 @@ void WebviewWindowsPlugin::RegisterWithRegistrar(
 
 WebviewWindowsPlugin::WebviewWindowsPlugin(flutter::TextureRegistrar* textures,
                                            flutter::BinaryMessenger* messenger)
-    : textures_(textures), messenger_(messenger) {
+    : alive_(std::make_shared<std::atomic<bool>>(true)),
+      textures_(textures),
+      messenger_(messenger) {
   window_class_.lpszClassName = L"FlutterWebviewMessage";
   window_class_.lpfnWndProc = &DefWindowProc;
   RegisterClass(&window_class_);
 }
 
 WebviewWindowsPlugin::~WebviewWindowsPlugin() {
-  // Null the plugin-level handler first: the lambda registered in
-  // RegisterWithRegistrar captures a raw `plugin_pointer = this`,
-  // and the messenger keeps that lambda alive independently of the
-  // MethodChannel wrapper. Without this null-out, a callback that
-  // fires after we return calls into freed `*this` and the host app
-  // dies in an EXCEPTION_ACCESS_VIOLATION_READ at offset ~0x1e8
-  // inside FlutterDesktopMessengerSetCallback. Per-WebviewBridge
-  // channels are cleared in their own destructor (webview_bridge.cc)
-  // when instances_.clear() runs immediately after this.
-  if (channel_) {
-    channel_->SetMethodCallHandler(nullptr);
-  }
+  // Flip the alive flag FIRST. Any callback the engine messenger
+  // dispatches after this point — including ones queued in the
+  // Win32 message pump before WM_CLOSE — sees alive_=false at its
+  // atomic_load and returns an error without dereferencing freed
+  // `*this`. memory_order_release pairs with the acquire load in
+  // the lambda (RegisterWithRegistrar).
+  alive_->store(false, std::memory_order_release);
+
+  // Tear down child bridges. Each bridge sets its own alive_=false
+  // first thing and SEH-guards any messenger-adjacent cleanup
+  // (see WebviewBridge::~WebviewBridge for the full rationale).
   instances_.clear();
+
   UnregisterClass(window_class_.lpszClassName, nullptr);
+
+  // Deliberately NOT calling channel_->SetMethodCallHandler(nullptr).
+  // The previous fix (commit 6939335) added that call to prevent
+  // the lambda from being dispatched on a freed `plugin_pointer`,
+  // but the call itself routes through
+  // FlutterDesktopMessengerSetCallback, which AVs at offset 0x1e8
+  // when the engine's destroy order has already invalidated the
+  // messenger before the plugin destructs (Sentry MOBILE-NEWS-CN,
+  // re-fired 2026-05-19 on the same signature it was supposed to
+  // address). The alive_ flag above provides the same protection
+  // without touching the messenger.
 }
 
 void WebviewWindowsPlugin::HandleMethodCall(
